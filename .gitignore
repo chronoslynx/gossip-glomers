@@ -3,10 +3,4 @@
 *.log
 tmp/
 go.sum
-
-
-broadcast
-unique-ids
-counter
-echo
-counter-crdt
+**/aut
