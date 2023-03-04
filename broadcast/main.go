@@ -43,7 +43,7 @@ func main() {
 	}
 
 	n.Handle("init", func(_ maelstrom.Message) error {
-		pool = gossip.NewHeap(n, applyUpdate)
+		pool = gossip.NewHeap(n, applyUpdate, 100)
 		go pool.Run(ctx)
 		return nil
 	})

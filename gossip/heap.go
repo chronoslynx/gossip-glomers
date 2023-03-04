@@ -10,10 +10,6 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-// NOTE: were this a real system I'd estimate this based on RTT between nodes
-const internodeLatency = 100 * time.Millisecond
-const retryDelay = internodeLatency * 4
-
 type Id struct {
 	Src   int    `json:"src"`
 	MsgId uint64 `json:"msgid"`
@@ -53,21 +49,24 @@ type Heap[T comparable] struct {
 	unsent  map[string][]Update[T]
 	updates chan T
 	gossip  chan Gossip[T]
+	// NOTE: were this a real system I'd estimate this based on RTT between nodes
+	retryDelay time.Time
 	// Called when receiving a new update via gossip
 	applyUpdate func(T)
 	acks        chan uint64
 }
 
-func NewHeap[T comparable](n *maelstrom.Node, apply func(T)) *Heap[T] {
+func NewHeap[T comparable](n *maelstrom.Node, apply func(T), latency time.Time) *Heap[T] {
 	group := n.NodeIDs()
 	self := n.ID()
 	sort.Strings(group)
 	// easy 2n, 2n+1 heaps rely on starting at one
 	heapIdx := sort.SearchStrings(group, self) + 1
 	gh := &Heap[T]{
-		nodeID: heapIdx,
-		node:   n,
-		nextID: 1,
+		retryDelay: latency * 4,
+		nodeID:     heapIdx,
+		node:       n,
+		nextID:     1,
 		peers: []string{
 			group[(2*heapIdx-1)%len(group)],
 			group[(2*heapIdx)%len(group)],
@@ -117,7 +116,7 @@ func (g *Heap[T]) Run(ctx context.Context) {
 			return
 		case <-tick.C:
 			now := time.Now()
-			nextTry := now.Add(retryDelay)
+			nextTry := now.Add(g.retryDelay)
 			for _, u := range g.pending {
 				if now.After(u.NextTry) {
 					u.NextTry = nextTry
