@@ -50,13 +50,13 @@ type Heap[T comparable] struct {
 	updates chan T
 	gossip  chan Gossip[T]
 	// NOTE: were this a real system I'd estimate this based on RTT between nodes
-	retryDelay time.Time
+	retryDelay time.Duration
 	// Called when receiving a new update via gossip
 	applyUpdate func(T)
 	acks        chan uint64
 }
 
-func NewHeap[T comparable](n *maelstrom.Node, apply func(T), latency time.Time) *Heap[T] {
+func NewHeap[T comparable](n *maelstrom.Node, apply func(T), latency time.Duration) *Heap[T] {
 	group := n.NodeIDs()
 	self := n.ID()
 	sort.Strings(group)
@@ -149,7 +149,6 @@ func (g *Heap[T]) Run(ctx context.Context) {
 			for idx := range goss.Deltas {
 				msg := goss.Deltas[idx]
 				if _, ok := g.seen[msg.Id]; !ok {
-					// TODO add to unsent
 					g.seen[msg.Id] = struct{}{}
 					g.applyUpdate(msg.Data)
 					for _, child := range g.peers {

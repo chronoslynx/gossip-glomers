@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	gossip "glomers/gossip"
@@ -43,7 +44,7 @@ func main() {
 	}
 
 	n.Handle("init", func(_ maelstrom.Message) error {
-		pool = gossip.NewHeap(n, applyUpdate, 100)
+		pool = gossip.NewHeap(n, applyUpdate, 100*time.Millisecond)
 		go pool.Run(ctx)
 		return nil
 	})

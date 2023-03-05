@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"log"
 	"sync/atomic"
+	"time"
+
+	gossip "glomers/gossip"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
-	gossip "glomers/gossip"
 )
 
 type Delta struct {
@@ -37,7 +39,7 @@ func main() {
 	}
 
 	n.Handle("init", func(_ maelstrom.Message) error {
-		pool = gossip.NewHeap(n, applyUpdate, 20)
+		pool = gossip.NewHeap(n, applyUpdate, 20*time.Millisecond)
 		go pool.Run(ctx)
 		return nil
 	})
