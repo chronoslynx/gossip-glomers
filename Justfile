@@ -15,6 +15,8 @@ broadcast-nemesis: (nemesis "broadcast" "broadcast" "partition" "25" "100")
 counter: (nemesis "g-counter" "counter" "partition" "3" "0")
 counter-crdt: (nemesis "g-counter" "counter-crdt" "partition" "3" "0")
 unique-ids: (maelstrom "broadcast" "unique-ids" "5" "10")
+kafka: (build "kafka")
+    cd ../maelstrom/maelstrom && ./maelstrom test -w kafka --bin {{`pwd` / "kafka" / "aut"}} --node-count 1 --concurrency 2n --time-limit 20 --rate 1000
 
 debug:
-    cd ../maelstrom && ./maelstrom serve
+    cd ../maelstrom/maelstrom && ./maelstrom serve
