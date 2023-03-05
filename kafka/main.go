@@ -46,6 +46,9 @@ func main() {
 		commits, commitOK := node.Handle[Offsets, json.RawMessage](n, "commit_offsets")
 		listReqs, lists := node.Handle[ListCommittedOffsets, Offsets](n, "list_committed_offsets")
 
+		// don't make this unlimited. It's a mistake
+		const pollLimit = 5
+
 		// State
 		keys := make(map[string][]int)
 		committed := make(map[string]int)
@@ -63,7 +66,12 @@ func main() {
 			case poll := <-polls:
 				resp := PollOK{MsgType: "poll_ok", Msgs: make(map[string][][2]int)}
 				for k, vs := range keys {
-					for i, v := range vs[poll.Offsets[k]:] {
+					start := poll.Offsets[k]
+					end := start + pollLimit
+					if end > len(vs) {
+						end = len(vs)
+					}
+					for i, v := range vs[start:end] {
 						resp.Msgs[k] = append(resp.Msgs[k], [2]int{poll.Offsets[k] + i, v})
 					}
 				}

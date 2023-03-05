@@ -45,6 +45,7 @@ func (n Node) Run() error {
 }
 
 func Handle[In any, Out any](n Node, kind string) (<-chan In, chan<- Out) {
+	// All channels are buffered by one so that replies _hopefully_ don't block receipt of new messages
 	inCh := make(chan In, 1)
 	outCh := make(chan Out, 1)
 
