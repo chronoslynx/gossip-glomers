@@ -4,11 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"sync"
 	"time"
 
-	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
-	gossip "glomers/gossip"
+	"glomers/gossip"
+	"glomers/node"
 )
 
 type Broadcast struct {
@@ -32,48 +31,46 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	n := maelstrom.NewNode()
-	block := new(sync.RWMutex)
-	var broadcasts []int
 	var pool *gossip.Heap[int]
 
-	applyUpdate := func(msg int) {
-		block.Lock()
-		defer block.Unlock()
-		broadcasts = append(broadcasts, msg)
-	}
+	initialized := make(chan struct{})
 
-	n.Handle("init", func(_ maelstrom.Message) error {
-		pool = gossip.NewHeap(n, applyUpdate, 100*time.Millisecond)
+	n := node.New(ctx, func(n node.Node) error {
+		pool = gossip.NewHeap[int](n, 100*time.Millisecond)
 		go pool.Run(ctx)
+		close(initialized)
 		return nil
 	})
 
-	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		var bcast Broadcast
-		if err := json.Unmarshal(msg.Body, &bcast); err != nil {
-			return err
+	bcasts, bcastOK := node.Handle[Broadcast, json.RawMessage](n, "broadcast")
+	reads, replies := node.Handle[struct{}, Bulk](n, "read")
+
+	go func() {
+		var broadcasts []int
+		select {
+		case <-ctx.Done():
+			return
+		case <-initialized:
 		}
-		pool.Apply(bcast.Message)
-
-		return n.Reply(msg, broadcastOk)
-	})
-
-	n.Handle("read", func(msg maelstrom.Message) error {
-		block.RLock()
-		bcasts := make([]int, len(broadcasts))
-		copy(bcasts, broadcasts)
-		block.RUnlock()
-
-		return n.Reply(msg, Bulk{
-			MsgType:  "read_ok",
-			Messages: bcasts,
-		})
-	})
-
-	n.Handle("topology", func(msg maelstrom.Message) error {
-		return n.Reply(msg, topoOk)
-	})
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case bcast := <-bcasts:
+				pool.Apply(bcast.Message)
+				node.Reply(n, bcastOK, broadcastOk)
+			case data := <-pool.Gossip:
+				broadcasts = append(broadcasts, data)
+			case <-reads:
+				bcasts := make([]int, len(broadcasts))
+				copy(bcasts, broadcasts)
+				node.Reply(n, replies, Bulk{
+					MsgType:  "read_ok",
+					Messages: bcasts,
+				})
+			}
+		}
+	}()
 
 	if err := n.Run(); err != nil {
 		log.Fatal(err)

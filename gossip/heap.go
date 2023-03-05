@@ -2,12 +2,11 @@ package gossip
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"sort"
 	"time"
 
-	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+	"glomers/node"
 )
 
 type Id struct {
@@ -21,47 +20,49 @@ type Update[T comparable] struct {
 }
 
 type Gossip[T comparable] struct {
-	Src         string      `json:"-"`
-	MaelstromID int         `json:"msg_id,omitempty"`
-	Recipient   string      `json:"-"`
-	NextTry     time.Time   `json:"-"`
-	MsgType     string      `json:"type"`
-	ID          uint64      `json:"id"`
-	Deltas      []Update[T] `json:"deltas"`
+	Src       string      `json:"-"`
+	Recipient string      `json:"-"`
+	NextTry   time.Time   `json:"-"`
+	MsgType   string      `json:"type"`
+	ID        uint64      `json:"id"`
+	Deltas    []Update[T] `json:"deltas"`
 }
 
 type GossipAck struct {
-	InReplyTo int    `json:"in_reply_to,omitempty"`
-	Sender    string `json:"-"`
-	MsgType   string `json:"type"`
-	ID        uint64 `json:"id"`
+	MsgType string `json:"type"`
+	ID      uint64 `json:"id"`
 }
 
 type Heap[T comparable] struct {
 	// We use a numeric ID here so we can use the tuple (nodeID, gossipID) as a map key
 	// that uniquely identifies an update originating at that node
-	nodeID  int
-	node    *maelstrom.Node
-	nextID  uint64
-	peers   []string
-	pending map[uint64]Gossip[T]
-	seen    map[Id]struct{}
-	unsent  map[string][]Update[T]
-	updates chan T
-	gossip  chan Gossip[T]
+	nodeID   int
+	node     node.Node
+	nextID   uint64
+	peers    []string
+	pending  map[uint64]Gossip[T]
+	seen     map[Id]struct{}
+	unsent   map[string][]Update[T]
+	updates  chan T
+	gossip   <-chan Gossip[T]
+	gossipOK chan<- GossipAck
 	// NOTE: were this a real system I'd estimate this based on RTT between nodes
 	retryDelay time.Duration
-	// Called when receiving a new update via gossip
-	applyUpdate func(T)
-	acks        chan uint64
+	acks       <-chan GossipAck
+	// Gossip shared with the application
+	Gossip chan T
 }
 
-func NewHeap[T comparable](n *maelstrom.Node, apply func(T), latency time.Duration) *Heap[T] {
+func NewHeap[T comparable](n node.Node, latency time.Duration) *Heap[T] {
 	group := n.NodeIDs()
 	self := n.ID()
 	sort.Strings(group)
 	// easy 2n, 2n+1 heaps rely on starting at one
 	heapIdx := sort.SearchStrings(group, self) + 1
+
+	gossip, gossipOK := node.Handle[Gossip[T], GossipAck](n, "gossip")
+	acks := node.HandleNoAck[GossipAck](n, "gossip_ok")
+
 	gh := &Heap[T]{
 		retryDelay: latency * 4,
 		nodeID:     heapIdx,
@@ -71,36 +72,15 @@ func NewHeap[T comparable](n *maelstrom.Node, apply func(T), latency time.Durati
 			group[(2*heapIdx-1)%len(group)],
 			group[(2*heapIdx)%len(group)],
 		},
-		seen:        make(map[Id]struct{}),
-		pending:     make(map[uint64]Gossip[T]),
-		unsent:      make(map[string][]Update[T]),
-		updates:     make(chan T),
-		gossip:      make(chan Gossip[T]),
-		applyUpdate: apply,
-		acks:        make(chan uint64),
+		seen:     make(map[Id]struct{}),
+		pending:  make(map[uint64]Gossip[T]),
+		unsent:   make(map[string][]Update[T]),
+		updates:  make(chan T, 1),
+		gossip:   gossip,
+		gossipOK: gossipOK,
+		Gossip:   make(chan T, 10),
+		acks:     acks,
 	}
-
-	n.Handle("gossip", func(msg maelstrom.Message) error {
-		var goss Gossip[T]
-		if err := json.Unmarshal(msg.Body, &goss); err != nil {
-			return err
-		}
-		goss.Src = msg.Src
-		gh.gossip <- goss
-		return nil
-	})
-
-	n.Handle("gossip_ok", func(msg maelstrom.Message) error {
-		var ack GossipAck
-		if err := json.Unmarshal(msg.Body, &ack); err != nil {
-			return err
-		}
-		ack.Sender = msg.Src
-		gh.acks <- ack.ID
-
-		return nil
-	})
-
 	return gh
 }
 
@@ -150,20 +130,20 @@ func (g *Heap[T]) Run(ctx context.Context) {
 				msg := goss.Deltas[idx]
 				if _, ok := g.seen[msg.Id]; !ok {
 					g.seen[msg.Id] = struct{}{}
-					g.applyUpdate(msg.Data)
+					select {
+					case <-ctx.Done():
+						return
+					case g.Gossip <- msg.Data:
+					}
 					for _, child := range g.peers {
 						g.unsent[child] = append(g.unsent[child], msg)
 					}
 				}
 			}
-			err := g.node.Send(goss.Src, GossipAck{
-				MsgType:   "gossip_ok",
-				ID:        goss.ID,
-				InReplyTo: goss.MaelstromID,
+			node.Reply(g.node, g.gossipOK, GossipAck{
+				MsgType: "gossip_ok",
+				ID:      goss.ID,
 			})
-			if err != nil {
-				log.Fatalf("Failed to respond to gossip: %s", err)
-			}
 		case msg := <-g.updates:
 			u := Update[T]{
 				Id: Id{
@@ -177,7 +157,7 @@ func (g *Heap[T]) Run(ctx context.Context) {
 				g.unsent[child] = append(g.unsent[child], u)
 			}
 		case ack := <-g.acks:
-			delete(g.pending, ack)
+			delete(g.pending, ack.ID)
 		}
 
 	}

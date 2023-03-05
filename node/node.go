@@ -5,43 +5,60 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-var initOk = json.RawMessage(`{"type":"init_ok"}`)
 var topoOk = json.RawMessage(`{"type":"topology_ok"}`)
 
 type Node struct {
 	ctx  context.Context
-	n    *maelstrom.Node
-	init func(n *maelstrom.Node) error
+	init func(n Node) error
+	*maelstrom.Node
 }
 
-func New(ctx context.Context, init func(n *maelstrom.Node) error) Node {
+func New(ctx context.Context, init func(n Node) error) Node {
 	n := Node{
-		ctx:  ctx,
-		n:    maelstrom.NewNode(),
-		init: init,
+		ctx,
+		init,
+		maelstrom.NewNode(),
 	}
 
 	if init != nil {
-		n.n.Handle("init", func(m maelstrom.Message) error {
-			if err := init(n.n); err != nil {
+		// Init requires special handling as maelstrom automatically ACKs it for you
+		n.Handle("init", func(m maelstrom.Message) error {
+			if err := init(n); err != nil {
 				return err
 			}
-			return n.n.Reply(m, initOk)
+			return nil
 		})
 	}
 	// I don't care about topology messages either
-	n.n.Handle("topology", func(msg maelstrom.Message) error {
-		return n.n.Reply(msg, topoOk)
+	n.Handle("topology", func(msg maelstrom.Message) error {
+		return n.Reply(msg, topoOk)
 	})
 
 	return n
 }
 
-func (n Node) Run() error {
-	return n.n.Run()
+func HandleNoAck[In any](n Node, kind string) <-chan In {
+	// All channels are buffered by one so that replies _hopefully_ don't block receipt of new messages
+	inCh := make(chan In, 1)
+
+	done := n.ctx.Done()
+	n.Handle(kind, func(msg maelstrom.Message) error {
+		var in In
+		if err := json.Unmarshal(msg.Body, &in); err != nil {
+			return fmt.Errorf("failed to unmarshal %s message as %T: %w", kind, in, err)
+		}
+		select {
+		case <-done:
+		case inCh <- in:
+		}
+		return nil
+	})
+
+	return inCh
 }
 
 func Handle[In any, Out any](n Node, kind string) (<-chan In, chan<- Out) {
@@ -50,7 +67,7 @@ func Handle[In any, Out any](n Node, kind string) (<-chan In, chan<- Out) {
 	outCh := make(chan Out, 1)
 
 	done := n.ctx.Done()
-	n.n.Handle(kind, func(msg maelstrom.Message) error {
+	n.Handle(kind, func(msg maelstrom.Message) error {
 		var in In
 		if err := json.Unmarshal(msg.Body, &in); err != nil {
 			return fmt.Errorf("failed to unmarshal %s message as %T: %w", kind, in, err)
@@ -63,7 +80,7 @@ func Handle[In any, Out any](n Node, kind string) (<-chan In, chan<- Out) {
 			case <-done:
 				return nil
 			case reply := <-outCh:
-				return n.n.Reply(msg, reply)
+				return n.Reply(msg, reply)
 			}
 		}
 	})
