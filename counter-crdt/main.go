@@ -4,12 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"sync/atomic"
 	"time"
 
-	gossip "glomers/gossip"
-
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+	"glomers/gossip"
+	"glomers/node"
 )
 
 type Delta struct {
@@ -29,18 +28,23 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	n := maelstrom.NewNode()
-
 	var pool *gossip.Heap[uint64]
+
 	var value uint64 = 0
-
-	applyUpdate := func(delta uint64) {
-		atomic.AddUint64(&value, delta)
-	}
-
-	n.Handle("init", func(_ maelstrom.Message) error {
-		pool = gossip.NewHeap(n, applyUpdate, 20*time.Millisecond)
+	n := node.New(ctx, func(n node.Node) error {
+		pool = gossip.NewHeap[uint64](n, 20*time.Millisecond)
 		go pool.Run(ctx)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case delta := <-pool.Gossip:
+					// writes are serialized so we don't need atomics
+					value += delta
+				}
+			}
+		}()
 		return nil
 	})
 
@@ -55,14 +59,11 @@ func main() {
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
+		// We don't care if our read is stale
 		return n.Reply(msg, Read{
 			MsgType: "read_ok",
-			Value:   atomic.LoadUint64(&value),
+			Value:   value,
 		})
-	})
-
-	n.Handle("topology", func(msg maelstrom.Message) error {
-		return n.Reply(msg, topoOk)
 	})
 
 	if err := n.Run(); err != nil {
