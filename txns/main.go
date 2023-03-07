@@ -58,34 +58,6 @@ type KV struct {
 	*maelstrom.KV
 }
 
-func (kv KV) ModifyLock(ctx context.Context, key string, shares int) error {
-	var err error
-	errCode := maelstrom.PreconditionFailed
-	for errCode == maelstrom.PreconditionFailed {
-		v := int(LockExclusive)
-		for shares > 0 && v == int(LockExclusive) {
-			v, err = kv.ReadInt(ctx, key)
-			if maelstrom.ErrorCode(err) == maelstrom.KeyDoesNotExist {
-				v = 0
-			} else if err != nil {
-				return err
-			}
-		}
-		new := v + shares
-		if new < 0 {
-			log.Fatalf("Invalid value for %s: cannot move from %d to %d", key, v, new)
-		}
-		err = kv.CompareAndSwap(ctx, key, v, new, true)
-		if err == nil {
-			errCode = 0
-		} else {
-			errCode = maelstrom.ErrorCode(err)
-		}
-	}
-
-	return err
-}
-
 type TxnState string
 
 const (
@@ -99,7 +71,7 @@ type Transaction struct {
 	ID     uint64
 	state  TxnState
 	isoLvl IsolationLvl
-	locks  map[string]LockHold
+	locks  map[string]*LockHold
 }
 
 func NewTransaction(ctx context.Context, kv KV, id uint64, isoLvl IsolationLvl) *Transaction {
@@ -109,22 +81,45 @@ func NewTransaction(ctx context.Context, kv KV, id uint64, isoLvl IsolationLvl) 
 		id,
 		StateRunning,
 		isoLvl,
-		make(map[string]LockHold),
+		make(map[string]*LockHold),
 	}
+}
+
+func (t *Transaction) release(lock *LockHold) error {
+	var err error
+	errCode := maelstrom.PreconditionFailed
+	for errCode == maelstrom.PreconditionFailed {
+		v, err := t.kv.ReadInt(t.ctx, lock.Name)
+		if err != nil {
+			return err
+		}
+		new := v - int(lock.State)
+		if new < 0 {
+			log.Fatalf("Invalid value for %s: invalid modification %d + %d -> %d", lock.Name, v, int(lock.State), new)
+		}
+		err = t.kv.CompareAndSwap(t.ctx, lock.Name, v, new, true)
+		if err == nil {
+			errCode = 0
+			lock.State = LockReleased
+		} else {
+			errCode = maelstrom.ErrorCode(err)
+		}
+	}
+
+	return err
 }
 
 // Code shared by both Commit and, if I implement it, Abort
 func (t *Transaction) releaseLocks() error {
 	var errs []string
-	for k, l := range t.locks {
-		if l.State == LockReleased {
-			errs = append(errs, fmt.Sprintf("2PC violation: lock %s released during acquire phase", l.Name))
+	for k, lock := range t.locks {
+		if lock.State == LockReleased {
+			errs = append(errs, fmt.Sprintf("2PC violation: lock %s released during acquire phase", lock.Name))
 		} else {
-			log.Printf("txn %d releasing %s lock for %s", t.ID, l.State, k)
-			if err := t.kv.ModifyLock(t.ctx, l.Name, -int(l.State)); err != nil {
+			log.Printf("txn %d releasing %s lock for %s", t.ID, lock.State, k)
+			if err := t.release(lock); err != nil {
 				errs = append(errs, err.Error())
 			}
-			l.State = LockReleased
 		}
 	}
 	if errs != nil {
@@ -166,23 +161,96 @@ func (t *Transaction) Read(key string) (int, error) {
 //
 // As they'll always grab locks in the order (x, y). This wouldn't be great for a realy database as transactions can
 // be long-lived and we don't know everything up front...
-func (t *Transaction) acquire(key string, mode LockState) (LockHold, error) {
+
+func (t *Transaction) acquireExclusive(lockName string) (hold *LockHold, err error) {
+	errCode := maelstrom.PreconditionFailed
+	for errCode == maelstrom.PreconditionFailed {
+		err = t.kv.CompareAndSwap(t.ctx, lockName, 0, int(LockExclusive), true)
+		if err == nil {
+			hold = &LockHold{
+				Name:  lockName,
+				State: LockExclusive,
+			}
+			errCode = 0
+		} else {
+			errCode = maelstrom.ErrorCode(err)
+		}
+	}
+
+	return
+}
+
+func (t *Transaction) acquireShared(lockName string) (hold *LockHold, err error) {
+	errCode := maelstrom.PreconditionFailed
+	for errCode == maelstrom.PreconditionFailed {
+		v := int(LockExclusive)
+		for v == int(LockExclusive) {
+			v, err = t.kv.ReadInt(t.ctx, lockName)
+			if maelstrom.ErrorCode(err) == maelstrom.KeyDoesNotExist {
+				v = 0
+			} else if err != nil {
+				return
+			}
+		}
+
+		err = t.kv.CompareAndSwap(t.ctx, lockName, v, v+1, true)
+		if err == nil {
+			hold = &LockHold{
+				Name:  lockName,
+				State: LockShared,
+			}
+			errCode = 0
+		} else {
+			errCode = maelstrom.ErrorCode(err)
+		}
+	}
+
+	return
+}
+
+func (t *Transaction) acquire(key string, mode LockState) (hold *LockHold, err error) {
 	if t.state != StateRunning {
-		return LockHold{}, fmt.Errorf("2PC violation: txn %d attempted to lock %s during release phase", t.ID, key)
+		err = fmt.Errorf("2PC violation: txn %d attempted to lock %s during release phase", t.ID, key)
+		return
 	}
 	lKey := fmt.Sprintf("lock-%s", key)
-	if mode == LockReleased {
-		return LockHold{}, fmt.Errorf("Fuck off with that. LockReleased is not a valid way to lock")
-	}
 	log.Printf("txn %d acquiring %s %s", t.ID, mode, lKey)
-	if err := t.kv.ModifyLock(t.ctx, lKey, int(mode)); err != nil {
-		return LockHold{}, fmt.Errorf("Txn %d could not acquire %s lock for %s: %w", t.ID, mode, key, err)
+	switch mode {
+	case LockReleased:
+		err = fmt.Errorf("Fuck off with that. LockReleased is not a valid way to lock")
+	case LockShared:
+		hold, err = t.acquireShared(lKey)
+	case LockExclusive:
+		hold, err = t.acquireExclusive(lKey)
+	default:
+		log.Fatalf("Invalid lock state %+v", mode)
+	}
+	if err != nil {
+		return
 	}
 	log.Printf("txn %d acquired %s %s", t.ID, mode, lKey)
-	return LockHold{
-		Name:  lKey,
-		State: mode,
-	}, nil
+	return
+}
+
+func (t *Transaction) Prelock(needs map[string]LockState) error {
+	keys := make([]string, 0, len(needs))
+	for k := range needs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for i := range keys {
+		key := keys[i]
+		mode, ok := needs[key]
+		if !ok {
+			log.Fatalf("Trying to lock unknown key %s given %+v", key, needs)
+		}
+		lock, err := t.acquire(key, mode)
+		if err != nil {
+			return err
+		}
+		t.locks[key] = lock
+	}
+	return nil
 }
 
 func (t *Transaction) upgradeLock(key string) error {
@@ -247,6 +315,23 @@ func main() {
 				t := NewTransaction(ctx, kv, nextTxnId, LvlReadUncommitted)
 				nextTxnId += nNodes
 				txn.MsgType = "txn_ok"
+				// Maelstrom assumes that all transactions must complete, even if they'd deadlock when run concurrently
+				// Rather than serialize transaction execution let's just scan ahead and gather all the locks
+				// ahead of time
+				lockNeeds := make(map[string]LockState)
+				for i := range txn.Operations {
+					op := txn.Operations[i]
+					opType := op[0].(string)
+					key := strconv.FormatInt(int64(op[1].(float64)), 10)
+					if _, found := lockNeeds[key]; !found && opType == "r" {
+						lockNeeds[key] = LockShared
+					} else if opType == "w" {
+						lockNeeds[key] = LockExclusive
+					}
+				}
+				if err := t.Prelock(lockNeeds); err != nil {
+					log.Fatalf("txn %d was unable to gather the locks it requires: %s", t.ID, err)
+				}
 				for i := range txn.Operations {
 					op := txn.Operations[i]
 					opType := op[0].(string)
