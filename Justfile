@@ -20,8 +20,11 @@ counter-crdt: (nemesis "g-counter" "counter-crdt" "partition" "3" "0")
 unique-ids: (maelstrom "unique-ids" "unique-ids" "5" "10")
 kafka: (build "kafka")
     cd {{maelstrom_dir}} && ./maelstrom test -w kafka --bin {{`pwd` / "kafka" / "aut"}} --node-count 1 --concurrency 2n --time-limit 20 --rate 1000
-txns-single: (build "txns")
+
+txns-a: (build "txns")
     cd {{maelstrom_dir}} && ./maelstrom test -w txn-rw-register --bin {{`pwd` / "txns" / "aut"}} --node-count 1 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models read-uncommitted --availability total
+txns-b: (build "txns")
+    cd {{maelstrom_dir}} && ./maelstrom test -w txn-rw-register --bin {{`pwd` / "txns" / "aut"}} --node-count 2 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models read-uncommitted --availability total
 
 debug:
     cd {{maelstrom_dir}} && ./maelstrom serve
